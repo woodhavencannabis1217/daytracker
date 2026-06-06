@@ -43,6 +43,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .pb-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
 .pb-time{font-size:1.1rem;font-weight:800;color:#60a5fa;font-variant-numeric:tabular-nums}
 .pb-place{font-size:.75rem;color:#888;max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.pb-mph{font-size:.7rem;color:#4ade80;font-weight:700;font-variant-numeric:tabular-nums}
 .pb-controls{display:flex;gap:8px;align-items:center}
 .pb-btn{background:none;border:none;color:#888;font-size:1.1rem;cursor:pointer;padding:4px}
 .pb-btn.active{color:#60a5fa}
@@ -115,6 +116,7 @@ input[type="file"]{display:none}
 <div class="playback" id="playbar">
   <div class="pb-top">
     <div class="pb-time" id="pbTime">--:--</div>
+    <div class="pb-mph" id="pbMph"></div>
     <div class="pb-place" id="pbPlace"></div>
     <div class="pb-controls">
       <button class="pb-btn" id="pbPrev">⏮</button>
@@ -485,11 +487,52 @@ function readRationals(data,offset,count,le){
   return vals;
 }
 
+/* ── Speed & Direction Helpers ── */
+function calcSpeed(p1,p2){
+  // Returns speed in mph between two GPS points
+  var d=hav(p1.lat,p1.lng,p2.lat,p2.lng); // meters
+  var dt=(p2.ts-p1.ts)/1000; // seconds
+  if(dt<=0)return 0;
+  var mps=d/dt;
+  return mps*2.23694; // m/s to mph
+}
+
+function calcBearing(p1,p2){
+  // Returns bearing in degrees (0=N, 90=E, 180=S, 270=W)
+  var dLon=(p2.lng-p1.lng)*Math.PI/180;
+  var lat1=p1.lat*Math.PI/180;
+  var lat2=p2.lat*Math.PI/180;
+  var y=Math.sin(dLon)*Math.cos(lat2);
+  var x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(dLon);
+  var brng=Math.atan2(y,x)*180/Math.PI;
+  return(brng+360)%360;
+}
+
+function getVehicle(mph){
+  // Returns emoji + label based on speed
+  if(mph<0.5) return{icon:'📍',label:'Stopped',size:36};
+  if(mph<4)   return{icon:'🚶',label:Math.round(mph)+' mph',size:36};
+  if(mph<15)  return{icon:'🚴',label:Math.round(mph)+' mph',size:38};
+  if(mph<60)  return{icon:'🚗',label:Math.round(mph)+' mph',size:42};
+  return{icon:'🚗',label:Math.round(mph)+' mph',size:42};
+}
+
+function makeVehicleIcon(emoji,size,rotation){
+  return L.divIcon({
+    className:'',
+    html:'<div style="font-size:'+size+'px;transform:rotate('+(rotation-90)+'deg);filter:drop-shadow(0 2px 6px rgba(0,0,0,.6));transition:transform .15s ease;line-height:1">'+emoji+'</div>',
+    iconSize:[size,size],
+    iconAnchor:[size/2,size/2]
+  });
+}
+
 /* ── Animated Playback ── */
-var playing=false,pbTimer=null,pbIndex=0,pbAnimMarker=null,pbAnimLine=null;
+var playing=false,pbTimer=null,pbIndex=0,pbAnimMarker=null,pbAnimLine=null,pbTrailLine=null;
 var speeds=[1,2,5,10,20];
 var speedIdx=1;
 var pbData=null;
+var lastVehicleType='';
+var lastBearing=0;
 
 $('playBtn').addEventListener('click',startPlayback);
 $('pbPlay').addEventListener('click',function(){playing?pausePlayback():resumePlayback()});
@@ -516,6 +559,8 @@ function startPlayback(){
 
   pbIndex=0;
   playing=true;
+  lastVehicleType='';
+  lastBearing=0;
   $('playbar').classList.add('show');
   $('bottomBar').style.display='none';
   $('pbPlay').textContent='⏸';
@@ -525,14 +570,18 @@ function startPlayback(){
   markers.forEach(function(m){myMap.removeLayer(m)});
   photoMarkers.forEach(function(m){myMap.removeLayer(m)});
 
+  // Trail glow line (behind the main path)
+  if(pbTrailLine)myMap.removeLayer(pbTrailLine);
+  pbTrailLine=L.polyline([],{color:'#60a5fa',weight:8,opacity:.15}).addTo(myMap);
+
   // Animated path line
   if(pbAnimLine)myMap.removeLayer(pbAnimLine);
   pbAnimLine=L.polyline([],{color:'#60a5fa',weight:4,opacity:.8}).addTo(myMap);
 
-  // Animated marker
+  // Animated vehicle marker — start with a pin
   if(pbAnimMarker)myMap.removeLayer(pbAnimMarker);
-  var ic=L.divIcon({className:'',html:'<div style="width:16px;height:16px;border-radius:50%;background:#60a5fa;border:3px solid #fff;box-shadow:0 0 0 8px rgba(96,165,250,.3),0 0 20px rgba(96,165,250,.4)"></div>',iconSize:[16,16],iconAnchor:[8,8]});
-  pbAnimMarker=L.marker([pbData.pts[0].lat,pbData.pts[0].lng],{icon:ic,zIndexOffset:1000}).addTo(myMap);
+  var startIcon=makeVehicleIcon('📍',36,0);
+  pbAnimMarker=L.marker([pbData.pts[0].lat,pbData.pts[0].lng],{icon:startIcon,zIndexOffset:1000}).addTo(myMap);
 
   myMap.setView([pbData.pts[0].lat,pbData.pts[0].lng],15);
   tick();
@@ -552,21 +601,45 @@ function tick(){
 
 function renderFrame(){
   if(!pbData||!pbData.pts[pbIndex])return;
-  var pt=pbData.pts[Math.min(pbIndex,pbData.pts.length-1)];
+  var idx=Math.min(pbIndex,pbData.pts.length-1);
+  var pt=pbData.pts[idx];
+
+  // Calculate speed and direction from previous point
+  var mph=0;
+  var bearing=lastBearing;
+  if(idx>0){
+    var prevPt=pbData.pts[idx-1];
+    mph=calcSpeed(prevPt,pt);
+    var newBearing=calcBearing(prevPt,pt);
+    // Only update bearing if actually moving (avoid jitter when stationary)
+    if(mph>0.5)bearing=newBearing;
+  }
+  lastBearing=bearing;
+
+  // Get vehicle type based on speed
+  var v=getVehicle(mph);
+
+  // Update vehicle icon if type changed
+  if(v.icon!==lastVehicleType||Math.abs(bearing-lastBearing)>15){
+    pbAnimMarker.setIcon(makeVehicleIcon(v.icon,v.size,bearing));
+    lastVehicleType=v.icon;
+  }
 
   // Move marker
   pbAnimMarker.setLatLng([pt.lat,pt.lng]);
   myMap.panTo([pt.lat,pt.lng],{animate:true,duration:.2});
 
   // Draw path up to this point
-  var coords=pbData.pts.slice(0,pbIndex+1).map(function(p){return[p.lat,p.lng]});
+  var coords=pbData.pts.slice(0,idx+1).map(function(p){return[p.lat,p.lng]});
   pbAnimLine.setLatLngs(coords);
+  pbTrailLine.setLatLngs(coords);
 
-  // Update time display
+  // Update time and speed display
   $('pbTime').textContent=fmtTime(pt.ts);
+  $('pbMph').textContent=mph>0.5?Math.round(mph)+' mph':'';
 
   // Progress bar
-  var pct=Math.min(100,(pbIndex/(pbData.pts.length-1))*100);
+  var pct=Math.min(100,(idx/(pbData.pts.length-1))*100);
   $('pbFill').style.width=pct+'%';
 
   // Check for stops at this time
@@ -574,7 +647,7 @@ function renderFrame(){
   pbData.stops.forEach(function(s){
     if(pt.ts>=s.t0&&(!s.t1||pt.ts<=s.t1))curPlace=s.name||'Stop';
   });
-  $('pbPlace').textContent=curPlace;
+  $('pbPlace').textContent=curPlace||(mph>0.5?v.label:'');
 
   // Show stop markers as we pass them
   pbData.stops.forEach(function(s,i){
@@ -636,9 +709,12 @@ function stopPlayback(){
   $('photoPopup').classList.remove('show');
   if(pbAnimMarker){myMap.removeLayer(pbAnimMarker);pbAnimMarker=null}
   if(pbAnimLine){myMap.removeLayer(pbAnimLine);pbAnimLine=null}
+  if(pbTrailLine){myMap.removeLayer(pbTrailLine);pbTrailLine=null}
   // Reset stop markers
   if(pbData)pbData.stops.forEach(function(s){delete s._shown});
   pbData=null;
+  lastVehicleType='';
+  lastBearing=0;
   renderDay();
 }
 
