@@ -85,6 +85,36 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .lightbox img{max-width:95%;max-height:88vh;border-radius:8px;object-fit:contain}
 
 input[type="file"]{display:none}
+
+/* Calendar overlay */
+.cal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;z-index:350;background:rgba(0,0,0,.92);backdrop-filter:blur(14px);display:none;overflow-y:auto}
+.cal-overlay.show{display:block}
+.cal-inner{max-width:380px;margin:0 auto;padding:16px}
+.cal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.cal-header h2{font-size:1.1rem;font-weight:700;color:#eee}
+.cal-header button{background:none;border:none;color:#888;font-size:1.3rem;cursor:pointer;padding:4px 8px}
+.cal-header button:hover{color:#fff}
+.cal-month{text-align:center;font-size:.9rem;font-weight:700;color:#ccc;margin-bottom:8px}
+.cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin-bottom:4px}
+.cal-weekdays span{text-align:center;font-size:.6rem;color:#555;font-weight:600;text-transform:uppercase;padding:4px 0}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal-day{aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:10px;cursor:pointer;background:#161616;border:1px solid transparent;position:relative;transition:all .15s}
+.cal-day:hover{background:#222}
+.cal-day.empty{background:transparent;cursor:default}
+.cal-day.today{border-color:#60a5fa}
+.cal-day.selected{background:#1a1f3d;border-color:#60a5fa}
+.cal-day.has-data{background:#0d1f0d;border-color:#1a3a1a}
+.cal-day.has-data:hover{background:#142e14}
+.cal-day .d-num{font-size:.82rem;font-weight:600;color:#888}
+.cal-day.has-data .d-num{color:#4ade80}
+.cal-day.today .d-num{color:#60a5fa}
+.cal-day .d-dots{display:flex;gap:2px;margin-top:2px}
+.cal-day .d-dots span{width:4px;height:4px;border-radius:50%}
+.cal-day .dot-path{background:#60a5fa}
+.cal-day .dot-photo{background:#f59e0b}
+.cal-day .dot-stops{background:#a78bfa}
+.date-label{cursor:pointer}
+.date-label:hover{color:#60a5fa}
 </style>
 </head>
 <body>
@@ -131,8 +161,22 @@ input[type="file"]{display:none}
 <!-- Bottom controls -->
 <div class="bottom" id="bottomBar">
   <button class="btn accent" id="playBtn">▶ Play My Day</button>
-  <button class="btn purple" id="photoBtn">📷 Add Photos</button>
-  <button class="btn" id="summaryBtn">📊 Summary</button>
+  <button class="btn purple" id="photoBtn">📷 Photos</button>
+  <button class="btn" id="calBtn">📅 Calendar</button>
+  <button class="btn" id="summaryBtn">📊</button>
+</div>
+
+<!-- Calendar overlay -->
+<div class="cal-overlay" id="calOv">
+  <div class="cal-inner">
+    <div class="cal-header">
+      <button id="calPrevM">◀</button>
+      <h2 id="calTitle"></h2>
+      <button id="calNextM">▶</button>
+    </div>
+    <div class="cal-weekdays"><span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span></div>
+    <div class="cal-grid" id="calGrid"></div>
+  </div>
 </div>
 
 <input type="file" id="fileIn" accept="image/*" multiple>
@@ -333,14 +377,45 @@ $('nextDay').addEventListener('click',function(){
   updateDateLabel();renderDay();stopPlayback();
 });
 
+/* ── Smart Photo Dedup ── */
+// Groups photos by time (within 5 min) + location (within 200m)
+// Keeps only 1 per group (the first one)
+function dedupPhotos(photos){
+  if(photos.length<=1)return photos;
+  photos.sort(function(a,b){return a.ts-b.ts});
+  var groups=[];
+  var used={};
+  for(var i=0;i<photos.length;i++){
+    if(used[i])continue;
+    var group=[photos[i]];
+    used[i]=true;
+    for(var j=i+1;j<photos.length;j++){
+      if(used[j])continue;
+      var timeDiff=Math.abs(photos[j].ts-photos[i].ts);
+      var locDiff=(photos[i].lat&&photos[j].lat)?hav(photos[i].lat,photos[i].lng,photos[j].lat,photos[j].lng):0;
+      // Same burst: within 5 min AND within 200m (or both have no GPS)
+      if(timeDiff<300000&&locDiff<200){
+        group.push(photos[j]);
+        used[j]=true;
+      }
+    }
+    groups.push(group);
+  }
+  // Keep 1 photo per group (first one)
+  return groups.map(function(g){return g[0]});
+}
+
 /* ── Photo Import (reads EXIF GPS + timestamp) ── */
 $('photoBtn').addEventListener('click',function(){$('fileIn').click()});
 
 $('fileIn').addEventListener('change',function(e){
   var files=e.target.files;
   if(!files.length)return;
-  var count=0;
-  Array.from(files).forEach(function(file){
+  var pending=[];
+  var processed=0;
+  var total=files.length;
+
+  Array.from(files).forEach(function(file,fi){
     var reader=new FileReader();
     reader.onload=function(ev){
       var buf=ev.target.result;
@@ -359,35 +434,45 @@ $('fileIn').addEventListener('change',function(e){
         var ts=exif.time||file.lastModified||Date.now();
 
         // If no GPS in EXIF, try to match to nearest tracked point
-        if(!exif.lat&&S.pts.length){
-          var closest=S.pts.reduce(function(best,p){var diff=Math.abs(p.ts-ts);return diff<best.diff?{diff:diff,p:p}:best},{diff:Infinity,p:null});
+        var key=dateKey(viewDate);
+        var data=(key===today())?S:load(key);
+        if(!exif.lat&&data.pts.length){
+          var closest=data.pts.reduce(function(best,p){var diff=Math.abs(p.ts-ts);return diff<best.diff?{diff:diff,p:p}:best},{diff:Infinity,p:null});
           if(closest.p){lat=closest.p.lat;lng=closest.p.lng}
         }
 
-        var photo={id:'p'+Date.now()+'_'+count,d:dataUrl,lat:lat,lng:lng,ts:ts};
-        var key=dateKey(viewDate);
-        var data=(key===today())?S:load(key);
-        data.photos.push(photo);
+        pending.push({id:'p'+Date.now()+'_'+fi,d:dataUrl,lat:lat,lng:lng,ts:ts});
+        processed++;
 
-        // Attach to nearest stop
-        if(data.stops.length){
-          var nearStop=null,nearDist=Infinity;
-          data.stops.forEach(function(s,i){
-            if(ts>=s.t0&&(!s.t1||ts<=s.t1)){nearStop=i;nearDist=0}
-            else{var d2=Math.min(Math.abs(ts-s.t0),Math.abs(ts-(s.t1||ts)));if(d2<nearDist&&d2<300000){nearDist=d2;nearStop=i}}
+        // All files processed — now dedup and save
+        if(processed===total){
+          var smart=dedupPhotos(pending);
+          var key2=dateKey(viewDate);
+          var data2=(key2===today())?S:load(key2);
+
+          smart.forEach(function(photo){
+            data2.photos.push(photo);
+            // Attach to nearest stop
+            if(data2.stops.length){
+              var nearStop=null,nearDist=Infinity;
+              data2.stops.forEach(function(s,i){
+                if(photo.ts>=s.t0&&(!s.t1||photo.ts<=s.t1)){nearStop=i;nearDist=0}
+                else{var d2=Math.min(Math.abs(photo.ts-s.t0),Math.abs(photo.ts-(s.t1||photo.ts)));if(d2<nearDist&&d2<300000){nearDist=d2;nearStop=i}}
+              });
+              if(nearStop!==null){
+                if(!data2.stops[nearStop].pIds)data2.stops[nearStop].pIds=[];
+                data2.stops[nearStop].pIds.push(photo.id);
+              }
+            }
           });
-          if(nearStop!==null){
-            if(!data.stops[nearStop].pIds)data.stops[nearStop].pIds=[];
-            data.stops[nearStop].pIds.push(photo.id);
-          }
-        }
 
-        save(key,data);
-        if(key===today())S=data;
-        count++;
-        if(count===files.length){
+          save(key2,data2);
+          if(key2===today())S=data2;
           renderDay();
-          toast(count+' photo'+(count>1?'s':'')+' added');
+          var msg=total>smart.length?
+            smart.length+' unique photo'+(smart.length!==1?'s':'')+' added ('+( total-smart.length)+' similar filtered out)':
+            smart.length+' photo'+(smart.length!==1?'s':'')+' added';
+          toast(msg);
         }
       };
       img.src=URL.createObjectURL(file);
@@ -739,6 +824,87 @@ $('summaryBtn').addEventListener('click',function(){
   $('stopsList').innerHTML=html;
 });
 $('closeStats').addEventListener('click',function(){$('statsOv').classList.remove('show')});
+
+/* ── Calendar ── */
+var calMonth=new Date(); // current month being viewed in calendar
+
+$('calBtn').addEventListener('click',openCalendar);
+$('dateLabel').addEventListener('click',openCalendar);
+
+function openCalendar(){
+  calMonth=new Date(viewDate);
+  renderCalendar();
+  $('calOv').classList.add('show');
+}
+
+$('calPrevM').addEventListener('click',function(){calMonth.setMonth(calMonth.getMonth()-1);renderCalendar()});
+$('calNextM').addEventListener('click',function(){
+  var now=new Date();
+  if(calMonth.getFullYear()>now.getFullYear()||(calMonth.getFullYear()===now.getFullYear()&&calMonth.getMonth()>=now.getMonth()))return;
+  calMonth.setMonth(calMonth.getMonth()+1);renderCalendar();
+});
+
+function renderCalendar(){
+  var y=calMonth.getFullYear(),m=calMonth.getMonth();
+  $('calTitle').textContent=calMonth.toLocaleDateString('en-US',{month:'long',year:'numeric'});
+
+  var firstDay=new Date(y,m,1).getDay();
+  var daysInMonth=new Date(y,m+1,0).getDate();
+  var todayKey=today();
+  var viewKey=dateKey(viewDate);
+
+  var html='';
+  // Empty cells before first day
+  for(var i=0;i<firstDay;i++)html+='<div class="cal-day empty"></div>';
+
+  for(var d=1;d<=daysInMonth;d++){
+    var dt=new Date(y,m,d);
+    var key=dt.toISOString().slice(0,10);
+    var isFuture=dt>new Date();
+    var data=null;
+    var hasData=false,hasPhotos=false,hasStops=false;
+
+    if(!isFuture){
+      try{var raw=localStorage.getItem('dt_'+key);if(raw){data=JSON.parse(raw);hasData=data.pts&&data.pts.length>1;hasPhotos=data.photos&&data.photos.length>0;hasStops=data.stops&&data.stops.length>0}}catch(e){}
+    }
+
+    var cls='cal-day';
+    if(hasData)cls+=' has-data';
+    if(key===todayKey)cls+=' today';
+    if(key===viewKey)cls+=' selected';
+    if(isFuture)cls+=' empty';
+
+    var dots='';
+    if(hasData)dots+='<span class="dot-path"></span>';
+    if(hasPhotos)dots+='<span class="dot-photo"></span>';
+    if(hasStops)dots+='<span class="dot-stops"></span>';
+
+    html+='<div class="'+cls+'" data-date="'+key+'"'+(isFuture?' style="opacity:.3;cursor:default"':'')+'><span class="d-num">'+d+'</span>'+(dots?'<div class="d-dots">'+dots+'</div>':'')+'</div>';
+  }
+
+  $('calGrid').innerHTML=html;
+
+  // Attach click handlers
+  var days=document.querySelectorAll('.cal-day:not(.empty)');
+  days.forEach(function(el){
+    el.addEventListener('click',function(){
+      var key=this.getAttribute('data-date');
+      if(!key)return;
+      var parts=key.split('-');
+      viewDate=new Date(parseInt(parts[0]),parseInt(parts[1])-1,parseInt(parts[2]));
+      updateDateLabel();
+      stopPlayback();
+      renderDay();
+      $('calOv').classList.remove('show');
+
+      // Auto-play if the day has tracking data
+      var data=load(key);
+      if(data.pts.length>=2){
+        setTimeout(startPlayback,400);
+      }
+    });
+  });
+}
 
 /* ── Lightbox ── */
 window.DT={lb:function(src){
